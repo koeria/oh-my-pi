@@ -51,6 +51,7 @@ import {
 	discoverAdvisorConfigs,
 	getOrCreateAdvisorProviderSessionId,
 	slugifyAdvisorName,
+	discoverAdvisorConfigs,
 } from "../advisor/config";
 import {
 	ADVISOR_DEFAULT_TOOL_NAMES,
@@ -2900,6 +2901,13 @@ export class SessionAdvisors {
 	setAdvisorEnabled(enabled: boolean): boolean {
 		this.#advisorEnabled = enabled;
 		if (enabled) {
+			// Discovery ran once at startup; a WATCHDOG.yml edited since then is
+			// invisible to this toggle. Re-discover in the background and rebuild
+			// when the roster or shared baseline changed so `/advisor on` picks up
+			// current rule text (issue #20541). The runtime built below may be
+			// replaced once; the toggle itself already rebuilds, so this matches
+			// existing semantics.
+			void this.#refreshDiscoveredAdvisorConfigs();
 			if (this.#advisors.length > 0 && !this.#advisorRuntimeMatchesCurrentConfig()) {
 				return this.#rebuildAdvisorRuntime();
 			}
@@ -2907,6 +2915,32 @@ export class SessionAdvisors {
 		}
 		this.#stopAdvisorRuntime();
 		return false;
+	}
+
+	/**
+	 * Re-run WATCHDOG.yml discovery against the session's current cwd and swap
+	 * in the live roster + shared baseline when they differ from the startup
+	 * snapshot. Failures are logged, never thrown — the startup discovery
+	 * result stays authoritative when re-discovery is unavailable.
+	 */
+	async #refreshDiscoveredAdvisorConfigs(): Promise<void> {
+		if (this.#host.isDisposed()) return;
+		try {
+			const discovered = await discoverAdvisorConfigs(this.#host.sessionManager.getCwd());
+			const changed =
+				JSON.stringify(discovered.advisors) !== JSON.stringify(this.#advisorConfigs) ||
+				discovered.sharedInstructions !== this.#advisorSharedInstructions ||
+				discovered.sharedMaxNotesPerUpdate !== this.#advisorSharedMaxNotesPerUpdate;
+			if (!changed) return;
+			this.#advisorConfigs = discovered.advisors;
+			this.#advisorSharedInstructions = discovered.sharedInstructions;
+			this.#advisorSharedMaxNotesPerUpdate = discovered.sharedMaxNotesPerUpdate;
+			if (this.#advisorEnabled) this.#rebuildAdvisorRuntime();
+		} catch (error) {
+			logger.debug("advisor config re-discovery failed; keeping startup snapshot", {
+				err: String(error),
+			});
+		}
 	}
 
 	/**
